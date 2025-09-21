@@ -1,0 +1,235 @@
+# app.py
+import re
+import textwrap
+import torch
+import gradio as gr
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+MODEL_NAME = "google/flan-t5-base"
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
+
+# Utility: count "real" sentences (naive but works well enough)
+def count_sentences(text):
+    # split on punctuation followed by space and a capital letter or newline
+    sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if len(s.strip()) > 5]
+    return len(sents), sents
+
+def generate_with_scores(prompt, max_new_tokens=200, temperature=0.0):
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    # deterministic for evaluation: temperature=0 -> greedy
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=(temperature>0.0),
+        temperature=temperature,
+        top_p=0.95,
+        return_dict_in_generate=True,
+        output_scores=True,
+    )
+    text = tokenizer.decode(outputs.sequences[0], skip_special_tokens=True)
+    # compute token-level max-prob at each generation step (approximate model confidence)
+    scores = []
+    for s in outputs.scores:
+        logits = s[0] if s.dim() == 2 else s
+        probs = torch.softmax(logits, dim=-1)
+        scores.append(float(torch.max(probs).item()))
+    mean_token_conf = float(sum(scores) / len(scores)) if scores else 0.5
+    return text, mean_token_conf
+
+def evaluate_claim(claim: str):
+    # 1) Strict instruction asking for JSON-like form so parsing is easy.
+    base_prompt = textwrap.dedent(f"""
+    Evaluate the following claim. OUTPUT EXACTLY in the following format (no extra text):
+    VERDICT: <TRUE / FALSE / UNKNOWN>
+    EXPLANATION: <At least 3 sentences explaining WHY. Use clear facts; avoid repeating the claim verbatim.>
+    (You may optionally include short 'EVIDENCE' lines if you know a source.)
+
+    Claim:
+    \"\"\"{claim}\"\"\"
+    """).strip()
+
+    # Generate first pass (greedy/deterministic to reduce hallucinations)
+    raw, token_conf = generate_with_scores(base_prompt, max_new_tokens=250, temperature=0.0)
+
+    # parse result
+    verdict = None
+    explanation = ""
+    # try to extract using regex
+    m_ver = re.search(r"VERDICT:\s*(TRUE|FALSE|UNKNOWN)", raw, flags=re.IGNORECASE)
+    if m_ver:
+        verdict = m_ver.group(1).upper()
+    m_exp = re.search(r"EXPLANATION:\s*(.*?)(?:$|\n[A-Z]{3,}:)", raw, flags=re.IGNORECASE | re.DOTALL)
+    if m_exp:
+        explanation = m_exp.group(1).strip()
+    else:
+        # fallback: treat whole output as explanation
+        explanation = raw.strip()
+
+    # If explanation too short (<3 sentences), ask model to expand (one retry)
+    n_sents, sents = count_sentences(explanation)
+    if n_sents < 3:
+        expand_prompt = textwrap.dedent(f"""
+        The previous explanation was too short. Please expand the EXPLANATION section to be at least 3 complete sentences,
+        keep it factual and concise, and do NOT repeat the claim verbatim.
+
+        Previous EXPLANATION:
+        \"\"\"{explanation}\"\"\"
+        """).strip()
+        ext_raw, ext_token_conf = generate_with_scores(expand_prompt, max_new_tokens=180, temperature=0.0)
+        # append expanded text (prefer the expanded if it's longer)
+        _, ext_sents = count_sentences(ext_raw)
+        if len(ext_sents) >= 3:
+            explanation = ext_raw.strip()
+            # update token_conf as weighted average
+            token_conf = (token_conf + ext_token_conf) / 2.0
+
+    # If verdict wasn't found, attempt to deduce from text
+    if not verdict:
+        if re.search(r"\btrue\b|\bcorrect\b|\baccurate\b", raw, flags=re.IGNORECASE):
+            verdict = "TRUE"
+        elif re.search(r"\bfalse\b|\bincorrect\b|\bnot true\b|\bno evidence\b", raw, flags=re.IGNORECASE):
+            verdict = "FALSE"
+        else:
+            verdict = "UNKNOWN"
+
+    # Heuristic adjustments to confidence using explanation content
+    expl_lower = explanation.lower()
+    adjust = 0.0
+    positive_keywords = ["evidence", "study", "studies", "observed", "documented", "measured", "consensus", "reported", "confirmed", "research"]
+    negative_keywords = ["no evidence", "no studies", "unsupported", "uncertain", "debated", "controversial", "no proof", "not proven", "lack of evidence"]
+    for kw in positive_keywords:
+        if kw in expl_lower:
+            adjust += 0.10
+    for kw in negative_keywords:
+        if kw in expl_lower:
+            adjust -= 0.18
+
+    # If verdict is FALSE, reduce confidence slightly (we want model to be cautious)
+    if verdict == "FALSE":
+        adjust -= 0.05
+    if verdict == "TRUE":
+        adjust += 0.03
+
+    combined = token_conf + adjust
+    # clamp between 0.01 and 0.99
+    combined = max(0.01, min(0.99, combined))
+    confidence_pct = round(combined * 100, 2)
+
+    # If the model repeated the claim as explanation or explanation looks like echo, force a redo with clearer instruction
+    if claim.strip().lower() in explanation.strip().lower()[:min(200, len(explanation))] and len(explanation) < 100:
+        redo_prompt = textwrap.dedent(f"""
+        The explanation echoed the claim. Please provide a clear EXPLANATION (at least 3 sentences) that explains WHY the claim is true or false,
+        using factual statements and avoiding simply repeating the claim.
+        Claim:
+        \"\"\"{claim}\"\"\"
+        """)
+        redo_raw, redo_token_conf = generate_with_scores(redo_prompt, max_new_tokens=220, temperature=0.0)
+        if len(redo_raw.strip()) > len(explanation):
+            explanation = redo_raw.strip()
+            combined = (combined + redo_token_conf) / 2.0
+            confidence_pct = round(max(0.01, min(0.99, combined)) * 100, 2)
+
+    # Format final output
+    final_md = f"**VERDICT:** {verdict}\n\n**EXPLANATION:**\n\n{explanation}\n\n**Legitimacy (confidence):** {confidence_pct}%"
+    return final_md
+
+# Gradio UI
+with gr.Blocks() as demo:
+    gr.Markdown("## 🧾 Claim Evaluator — concise explanation (>=3 sentences) + improved legitimacy score")
+    inp = gr.Textbox(lines=2, placeholder="Enter a claim to evaluate (e.g. 'The Moon is made of green cheese.')")
+    out = gr.Markdown()
+    btn = gr.Button("Evaluate Claim")
+
+    btn.click(evaluate_claim, inputs=inp, outputs=out)
+
+if __name__ == "__main__":
+    demo.launch()
+
+
+
+WORKFLOW :-
+1. Create/Setup Hugging Face Space
+Go to 🤗 Spaces → Create Space.
+
+SDK: Gradio
+
+Hardware:
+
+Free CPU → slow, but works.
+
+T4 GPU (Pro) → faster & better for flan-t5.
+
+2. Add app.py
+Paste your code exactly as you shared (the claim evaluator).
+
+Make sure the filename is app.py.
+
+3. Add requirements.txt
+This tells the Space which libraries to install.
+
+txt
+Copy code
+transformers==4.44.2
+torch==2.3.1
+accelerate==0.33.0
+gradio==4.41.0
+(You can also add sentencepiece if you run into tokenizer issues)
+
+4. Folder Structure
+Your Space should look like:
+
+perl
+Copy code
+my-space/
+│── app.py
+│── requirements.txt
+5. Push & Run
+Commit the files.
+
+Hugging Face will auto-rebuild → wait for build logs to finish.
+
+Once ready, test with a claim like:
+
+csharp
+Copy code
+The moon is made of cheese.
+6. Performance & Improvements
+flan-t5-base is only 250M parameters → very light, but not great at fact-checking.
+
+If you want better answers, try switching model in your code:
+
+python
+Copy code
+MODEL_NAME = "google/flan-t5-large"
+or
+
+python
+Copy code
+MODEL_NAME = "google/flan-t5-xl"
+(needs GPU hardware, not free tier).
+
+7. Optional: Add UI Polishing
+Add gr.Examples so users can test with pre-made claims.
+
+Add a history log if you want multiple checks.
+
+
+
+✅ So your workflow order is:
+
+Create Space → SDK Gradio.
+
+Add app.py (your code).
+
+Add requirements.txt.
+
+Push → Let build finish.
+
+Test claims.
+
+(Optional) Upgrade model to large/xl for accuracy.
+
+
